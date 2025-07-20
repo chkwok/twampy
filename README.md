@@ -1,4 +1,9 @@
 # Python tools for TWAMP and TWAMP light
+
+**Note: This is a fork of the original Nokia twampy project. Changes may or may not work as expected. These
+modifications have been created for personal use to trace network latency issues as an alternative to ping flooding.
+These changes are made almost exclusively by Claude Code.**
+
 Twampy is a Python implementation of the Two-Way Active Measurement
 Protocol (TWAMP and TWAMP light) as defined in RFC5357. This tool
 was developed to validate the Nokia SR OS TWAMP implementation.
@@ -23,6 +28,12 @@ Cloning into 'twampy'...
 ```
 
 ##  Usage Notes
+
+**Important:** Round-trip time (RTT) measurements are not dependent on time synchronization between endpoints, but inbound/outbound latency calculations require synchronized clocks. If you experience issues with inbound/outbound measurements, ensure NTP time synchronization:
+- **macOS**: `sudo sntp -sS time.apple.com`  
+- **Windows**: Install and configure Meinberg NTP (w32tm was unreliable with persistent 700ms+ offsets)
+- **Cloud VMs**: Most major cloud providers (AWS, Azure, GCP) synchronize time automatically
+
 Use padding to configure bidirectional packet/frame sizes:
 
 IP Version | Padding | Packet Size | Frame Size
@@ -174,6 +185,68 @@ Direction         Min         Max         Avg          Jitter     Loss
 ===============================================================================
 ```
 
+## Simple Usage Examples
+
+### Running as TWAMP Light Reflector (Target)
+To run a simple reflector that listens for test packets and reflects them back:
+
+```bash
+# Basic reflector on default port 20001
+./twampy.py responder
+
+# Reflector on specific address and port
+./twampy.py responder 192.168.1.100:20001
+
+# Reflector with testing mode to simulate network issues
+./twampy.py responder --test-mode --drop-rate 5 --reorder-rate 2 --delay-rate 3
+```
+
+The reflector will listen for incoming test packets and automatically reflect them back to the sender.
+
+### Running as TWAMP Light Sender
+To send test packets to a reflector and measure latency:
+
+```bash
+# Basic sender to localhost reflector
+./twampy.py sender 192.168.1.100:20001
+
+# Sender with custom parameters (1000 packets at 50ms intervals)
+./twampy.py sender 192.168.1.100:20001 :20000 -c 1000 -i 50
+
+# Sender with real-time response monitoring
+./twampy.py sender 192.168.1.100:20001 --print-responses --stats-interval 10
+```
+
+### Key Flags for Real-Time Monitoring
+
+- `--print-responses`: Display latency information for each response packet as it arrives
+- `--stats-interval N`: Print interim statistics every N seconds (e.g., `--stats-interval 5`)
+- `--packet-timeout N`: Set per-packet timeout in seconds (default: 5.0)
+
+#### Example Output with Real-Time Monitoring
+```bash
+./twampy.py sender 192.168.1.100:20001 --print-responses --stats-interval 5
+
+Reply from 192.168.1.100 [seq=0] RTT=1.23ms Outbound=0.65ms Inbound=0.58ms
+Reply from 192.168.1.100 [seq=1] RTT=1.18ms Outbound=0.62ms Inbound=0.56ms
+Gap detected: packet [3] missing (received seq=4)
+Reply from 192.168.1.100 [seq=2] RTT=1.25ms Outbound=0.67ms Inbound=0.58ms
+Out-of-order: packet [seq=3] arrived late
+--- Current Statistics at 25/07/20 14:30:15 (received: 4, sent: 5) ---
+  Outbound:  Min=0.62ms Max=0.67ms Avg=0.64ms Jitter=23us Loss=0.0%
+  Inbound:   Min=0.56ms Max=0.58ms Avg=0.57ms Jitter=12us Loss=0.0%
+  Roundtrip: Min=1.18ms Max=1.25ms Avg=1.22ms Jitter=31us Loss=20.0%
+```
+
+This mode provides immediate feedback on each packet's performance and shows out-of-order arrivals, gaps, and timeouts in real-time.
+
+## Recent Changes
+
+### Recent Fork Improvements
+- **Python 3.8+ Compatibility**: Replaced deprecated `time.clock()` with `time.perf_counter()` for compatibility with Python 3.8 and later versions
+- **Windows Socket Fixes**: Fixed Windows socket compatibility issues by using `IPPROTO_IP` instead of `SOL_IP` for TTL and do-not-fragment socket options
+- **Out-of-Order Packet Detection**: Added comprehensive detection and testing framework for out-of-order packet handling
+- **Real-Time Statistics**: Added real-time response monitoring with timestamped interim statistics display
 
 ## License
 
