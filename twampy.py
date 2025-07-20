@@ -94,7 +94,7 @@ import select
 #############################################################################
 
 if (sys.platform == "win32"):
-    time0 = time.time() - time.clock()
+    time0 = time.time() - time.perf_counter()
 
 # Constants to convert between python timestamps and NTP 8B binary format [RFC1305]
 TIMEOFFSET = 2208988800     # Time Difference: 1-JAN-1900 to 1-JAN-1970
@@ -103,7 +103,7 @@ ALLBITS = 0xFFFFFFFF        # To calculate 32bit fraction of the second
 
 def now():
     if (sys.platform == "win32"):
-        return time.clock() + time0
+        return time.perf_counter() + time0
     return time.time()
 
 
@@ -174,14 +174,17 @@ class udpSession(threading.Thread):
         self.socket = socket.socket(
             socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
-        self.socket.setsockopt(socket.SOL_IP,     socket.IP_TTL, ttl)
+        if (sys.platform == "win32"):
+            self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+        else:
+            self.socket.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((addr, port))
         if df:
             if (sys.platform == "linux"):
                 self.socket.setsockopt(socket.SOL_IP, 10, 2)
             elif (sys.platform == "win32"):
-                self.socket.setsockopt(socket.SOL_IP, 14, 1)
+                self.socket.setsockopt(socket.IPPROTO_IP, 14, 1)
             elif (sys.platform == "darwin"):
                 log.error("do-not-fragment can not be set on darwin")
             else:
