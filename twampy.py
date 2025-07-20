@@ -280,6 +280,24 @@ class twampStatistics():
 
         self.count += 1
 
+    def print_current(self, total_sent):
+        if self.count > 0:
+            loss_rt = total_sent - self.count
+            print("--- Current Statistics (received: %d, sent: %d) ---" % (self.count, total_sent))
+            print("  Outbound:  Min=%s Max=%s Avg=%s Jitter=%s Loss=%.1f%%" % 
+                  (dp(self.minOB), dp(self.maxOB), dp(self.sumOB / self.count), dp(self.jitterOB), 
+                   100 * float(self.lossOB) / total_sent if total_sent > 0 else 0))
+            print("  Inbound:   Min=%s Max=%s Avg=%s Jitter=%s Loss=%.1f%%" % 
+                  (dp(self.minIB), dp(self.maxIB), dp(self.sumIB / self.count), dp(self.jitterIB), 
+                   100 * float(self.lossIB) / total_sent if total_sent > 0 else 0))
+            print("  Roundtrip: Min=%s Max=%s Avg=%s Jitter=%s Loss=%.1f%%" % 
+                  (dp(self.minRT), dp(self.maxRT), dp(self.sumRT / self.count), dp(self.jitterRT), 
+                   100 * float(loss_rt) / total_sent if total_sent > 0 else 0))
+        else:
+            print("--- Current Statistics (received: 0, sent: %d) ---" % total_sent)
+            print("  NO RESPONSES RECEIVED YET")
+        sys.stdout.flush()
+
     def dump(self, total):
         print("===============================================================================")
         print("Direction         Min         Max         Avg          Jitter     Loss")
@@ -315,6 +333,9 @@ class twampySessionSender(udpSession):
         self.interval = float(args.interval) / 1000
         self.count = args.count
         self.stats = twampStatistics()
+        self.stats_interval = args.stats_interval
+        self.print_responses = args.print_responses
+        self.packet_timeout = args.packet_timeout
 
         if args.padding != -1:
             self.padmix = [args.padding]
@@ -326,6 +347,8 @@ class twampySessionSender(udpSession):
     def run(self):
         schedule = now()
         endtime = schedule + self.count * self.interval + 5
+        next_stats_print = now() + self.stats_interval if self.stats_interval > 0 else endtime + 1
+        sent_packets = {}  # Track sent packets: {seq_num: send_time}
 
         idx = 0
         while self.running:
@@ -348,6 +371,14 @@ class twampySessionSender(udpSession):
                 rseq = struct.unpack('!I', data[0:4])[0]
                 sseq = struct.unpack('!I', data[24:28])[0]
 
+                # Remove from sent packets tracking (packet received)
+                if sseq in sent_packets:
+                    del sent_packets[sseq]
+
+                if self.print_responses:
+                    print("Reply from %s [seq=%d] RTT=%s Outbound=%s Inbound=%s" % 
+                          (address[0], sseq, dp(delayRT), dp(delayOB), dp(delayIB)))
+
                 log.info("Reply from %s [rseq=%d sseq=%d rtt=%.2fms outbound=%.2fms inbound=%.2fms]", address[0], rseq, sseq, delayRT, delayOB, delayIB)
                 self.stats.add(delayRT, delayOB, delayIB, rseq, sseq)
 
@@ -356,11 +387,32 @@ class twampySessionSender(udpSession):
                     self.running = False
 
             t1 = now()
+            
+            # Check for timed out packets
+            timed_out_packets = []
+            for seq_num, send_time in list(sent_packets.items()):
+                if t1 - send_time > self.packet_timeout:
+                    timed_out_packets.append(seq_num)
+                    del sent_packets[seq_num]
+            
+            # Print timeout notifications
+            if self.print_responses and timed_out_packets:
+                for seq_num in sorted(timed_out_packets):
+                    print("Timeout: packet [seq=%d] lost (no response after %.1fs)" % (seq_num, self.packet_timeout))
+            
+            # Check if it's time to print periodic statistics
+            if self.stats_interval > 0 and t1 >= next_stats_print:
+                self.stats.print_current(idx)
+                next_stats_print = t1 + self.stats_interval
+            
             if (t1 >= schedule) and (idx < self.count):
                 schedule = schedule + self.interval
 
                 data = struct.pack('!L2IH', idx, int(TIMEOFFSET + t1), int((t1 - int(t1)) * ALLBITS), 0x3fff)
                 pbytes = zeros(self.padmix[int(len(self.padmix) * random.random())])
+
+                # Track this packet for timeout detection
+                sent_packets[idx] = t1
 
                 self.sendto(data + pbytes, (self.remote_addr, self.remote_port))
                 log.info("Sent to %s [sseq=%d]", self.remote_addr, idx)
@@ -720,6 +772,9 @@ if __name__ == '__main__':
     group.add_argument('near_end', nargs='?', metavar='local-ip:port', default=":20000")
     group.add_argument('-i', '--interval', metavar='msec', default=100,  type=int, help="[100,1000]")
     group.add_argument('-c', '--count',    metavar='packets', default=100,  type=int, help="[1..9999]")
+    group.add_argument('--stats-interval', metavar='seconds', default=5, type=int, help="Print statistics every N seconds (default: 5, 0=disable)")
+    group.add_argument('--print-responses', action='store_true', help="Print latency for each response received")
+    group.add_argument('--packet-timeout', metavar='seconds', default=5.0, type=float, help="Per-packet timeout in seconds (default: 5.0)")
 
     p_control = subparsers.add_parser('controller', help='TWAMP controller', parents=[debug_parser, ipopt_parser])
     group = p_control.add_argument_group("TWAMP controller options")
