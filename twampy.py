@@ -81,6 +81,7 @@ import os
 import struct
 import sys
 import time
+import datetime
 import socket
 import logging
 import binascii
@@ -281,9 +282,10 @@ class twampStatistics():
         self.count += 1
 
     def print_current(self, total_sent):
+        timestamp = datetime.datetime.now().strftime('%y/%m/%d %H:%M:%S')
         if self.count > 0:
             loss_rt = total_sent - self.count
-            print("--- Current Statistics (received: %d, sent: %d) ---" % (self.count, total_sent))
+            print("--- Current Statistics at %s (received: %d, sent: %d) ---" % (timestamp, self.count, total_sent))
             print("  Outbound:  Min=%s Max=%s Avg=%s Jitter=%s Loss=%.1f%%" % 
                   (dp(self.minOB), dp(self.maxOB), dp(self.sumOB / self.count), dp(self.jitterOB), 
                    100 * float(self.lossOB) / total_sent if total_sent > 0 else 0))
@@ -294,7 +296,7 @@ class twampStatistics():
                   (dp(self.minRT), dp(self.maxRT), dp(self.sumRT / self.count), dp(self.jitterRT), 
                    100 * float(loss_rt) / total_sent if total_sent > 0 else 0))
         else:
-            print("--- Current Statistics (received: 0, sent: %d) ---" % total_sent)
+            print("--- Current Statistics at %s (received: 0, sent: %d) ---" % (timestamp, total_sent))
             print("  NO RESPONSES RECEIVED YET")
         sys.stdout.flush()
 
