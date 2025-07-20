@@ -214,16 +214,54 @@ class udpSession(threading.Thread):
     def stop(self, signum, frame):
         log.info("SIGINT received: Stop TWL session reflector")
         self.running = False
-        self.socket.shutdown(socket.SHUT_RDWR)
-        self.socket.close()
+        
+        # Print testing statistics immediately if this is a reflector with test mode
+        if hasattr(self, 'test_mode') and self.test_mode:
+            # Send any pending responses before showing statistics
+            if hasattr(self, 'pending_responses') and len(self.pending_responses) > 0:
+                log.info("Sending %d pending responses before exit", len(self.pending_responses))
+                for response in self.pending_responses:
+                    try:
+                        self.sendto(response['data'], response['address'])
+                        log.info("TEST: Sent pending %s packet [sseq=%d]", response['type'], response['sseq'])
+                    except Exception as e:
+                        log.debug("Failed to send pending response: %s", str(e))
+                self.pending_responses = []
+            
+            total_packets = sum(self.test_stats.values())
+            print("Testing Statistics Summary:")
+            print("  Total packets processed: %d" % total_packets)
+            print("  Normal responses: %d (%.1f%%)" % (self.test_stats['normal'], 
+                     100 * self.test_stats['normal'] / total_packets if total_packets > 0 else 0))
+            print("  Dropped packets: %d (%.1f%%)" % (self.test_stats['dropped'],
+                     100 * self.test_stats['dropped'] / total_packets if total_packets > 0 else 0))
+            print("  Delayed packets: %d (%.1f%%)" % (self.test_stats['delayed'],
+                     100 * self.test_stats['delayed'] / total_packets if total_packets > 0 else 0))
+            print("  Reordered packets: %d (%.1f%%)" % (self.test_stats['reordered'],
+                     100 * self.test_stats['reordered'] / total_packets if total_packets > 0 else 0))
+            print("  Duplicated packets: %d (%.1f%%)" % (self.test_stats['duplicated'],
+                     100 * self.test_stats['duplicated'] / total_packets if total_packets > 0 else 0))
+            print("  Pending responses: %d" % len(self.pending_responses))
+        
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except Exception as e:
+            log.debug("Socket shutdown failed: %s", str(e))
+        try:
+            self.socket.close()
+        except Exception as e:
+            log.debug("Socket close failed: %s", str(e))
 
 
 class twampStatistics():
 
     def __init__(self):
         self.count = 0
+        self.out_of_order_count = 0
+        self.late_arrivals = 0
+        self.duplicates = 0
 
-    def add(self, delayRT, delayOB, delayIB, rseq, sseq):
+    def add(self, delayRT, delayOB, delayIB, rseq, sseq, order_status='in_order'):
         if self.count == 0:
             self.minOB = delayOB
             self.minIB = delayIB
@@ -279,6 +317,14 @@ class twampStatistics():
             self.lastIB = delayIB
             self.lastRT = delayRT
 
+        # Track ordering statistics
+        if order_status == 'out_of_order':
+            self.out_of_order_count += 1
+        elif order_status == 'late_arrival':
+            self.late_arrivals += 1
+        elif order_status == 'duplicate':
+            self.duplicates += 1
+
         self.count += 1
 
     def print_current(self, total_sent):
@@ -295,6 +341,9 @@ class twampStatistics():
             print("  Roundtrip: Min=%s Max=%s Avg=%s Jitter=%s Loss=%.1f%%" % 
                   (dp(self.minRT), dp(self.maxRT), dp(self.sumRT / self.count), dp(self.jitterRT), 
                    100 * float(loss_rt) / total_sent if total_sent > 0 else 0))
+            if self.out_of_order_count > 0 or self.late_arrivals > 0 or self.duplicates > 0:
+                print("  Reordering: Out-of-order=%d Late-arrivals=%d Duplicates=%d" % 
+                      (self.out_of_order_count, self.late_arrivals, self.duplicates))
         else:
             print("--- Current Statistics at %s (received: 0, sent: %d) ---" % (timestamp, total_sent))
             print("  NO RESPONSES RECEIVED YET")
@@ -312,6 +361,12 @@ class twampStatistics():
         else:
             print("  NO STATS AVAILABLE (100% loss)")
         print("-------------------------------------------------------------------------------")
+        if self.out_of_order_count > 0 or self.late_arrivals > 0 or self.duplicates > 0:
+            print("Reordering Statistics:")
+            print("  Out-of-order packets: %d" % self.out_of_order_count)
+            print("  Late arrivals: %d" % self.late_arrivals)
+            print("  Duplicate packets: %d" % self.duplicates)
+            print("-------------------------------------------------------------------------------")
         print("                                                    Jitter Algorithm [RFC1889]")
         print("===============================================================================")
         sys.stdout.flush()
@@ -338,6 +393,12 @@ class twampySessionSender(udpSession):
         self.stats_interval = args.stats_interval
         self.print_responses = args.print_responses
         self.packet_timeout = args.packet_timeout
+        
+        # Sequence tracking for out-of-order detection
+        self.received_packets = set()
+        self.expected_next_seq = 0
+        self.missing_ranges = []  # Track ranges of missing packets
+        self.timed_out_packets = set()  # Track packets that have been declared timed out
 
         if args.padding != -1:
             self.padmix = [args.padding]
@@ -345,6 +406,77 @@ class twampySessionSender(udpSession):
             self.padmix = [0, 0, 0, 0, 0, 0, 0, 514, 514, 514, 514, 1438]
         else:
             self.padmix = [8, 8, 8, 8, 8, 8, 8, 534, 534, 534, 534, 1458]
+
+    def analyze_sequence(self, sseq):
+        """
+        Analyze received sequence for ordering issues.
+        Returns: ('in_order'|'gap_detected'|'out_of_order'|'late_arrival', gap_info)
+        """
+        timestamp = datetime.datetime.now().strftime('%y/%m/%d %H:%M:%S')
+        
+        # Check if this packet was already received (duplicate)
+        if sseq in self.received_packets:
+            return 'duplicate', None
+            
+        # Check if this packet was previously timed out (late arrival)
+        if sseq in self.timed_out_packets:
+            self.timed_out_packets.remove(sseq)
+            self.received_packets.add(sseq)
+            return 'late_arrival', None
+            
+        # Add to received set
+        self.received_packets.add(sseq)
+        
+        # Check if packet arrived in order
+        if sseq == self.expected_next_seq:
+            # In-order packet - advance expected sequence
+            self.expected_next_seq += 1
+            
+            # Check if this fills any gaps (removes missing ranges)
+            self.missing_ranges = [(start, end) for start, end in self.missing_ranges 
+                                 if not (start <= sseq <= end)]
+            
+            return 'in_order', None
+            
+        elif sseq > self.expected_next_seq:
+            # Gap detected - missing packets between expected and received
+            gap_start = self.expected_next_seq
+            gap_end = sseq - 1
+            
+            # Add missing range
+            self.missing_ranges.append((gap_start, gap_end))
+            
+            # Update expected sequence
+            self.expected_next_seq = sseq + 1
+            
+            # Format gap info for notification
+            if gap_start == gap_end:
+                gap_info = f"packet [{gap_start}] missing"
+            else:
+                gap_info = f"packets [{gap_start}-{gap_end}] missing"
+                
+            return 'gap_detected', gap_info
+            
+        else:  # sseq < self.expected_next_seq
+            # Out-of-order arrival - all packets arriving out of sequence are "out_of_order"
+            # regardless of whether they fill gaps or not
+            
+            # Remove this sequence from missing ranges if it was missing
+            was_missing = any(start <= sseq <= end for start, end in self.missing_ranges)
+            if was_missing:
+                new_ranges = []
+                for start, end in self.missing_ranges:
+                    if start <= sseq <= end:
+                        # Split the range if needed
+                        if start < sseq:
+                            new_ranges.append((start, sseq - 1))
+                        if sseq < end:
+                            new_ranges.append((sseq + 1, end))
+                    else:
+                        new_ranges.append((start, end))
+                self.missing_ranges = new_ranges
+            
+            return 'out_of_order', None
 
     def run(self):
         schedule = now()
@@ -373,6 +505,24 @@ class twampySessionSender(udpSession):
                 rseq = struct.unpack('!I', data[0:4])[0]
                 sseq = struct.unpack('!I', data[24:28])[0]
 
+                # Analyze sequence ordering
+                order_status, gap_info = self.analyze_sequence(sseq)
+                timestamp = datetime.datetime.now().strftime('%y/%m/%d %H:%M:%S')
+
+                # Print ordering notifications
+                if order_status == 'gap_detected' and self.print_responses:
+                    print("%s Gap detected: %s (received seq=%d)" % (timestamp, gap_info, sseq))
+                elif order_status == 'late_arrival' and self.print_responses:
+                    print("%s Out-of-order: packet [seq=%d] arrived late" % (timestamp, sseq))
+                elif order_status == 'out_of_order' and self.print_responses:
+                    print("%s Out-of-order: packet [seq=%d] arrived out of sequence" % (timestamp, sseq))
+                elif order_status == 'duplicate':
+                    if self.print_responses:
+                        print("%s Duplicate: packet [seq=%d] already received" % (timestamp, sseq))
+                    # Still track duplicate in statistics but don't process timing
+                    self.stats.add(0, 0, 0, rseq, sseq, order_status)
+                    continue  # Skip timing processing for duplicates
+
                 # Remove from sent packets tracking (packet received)
                 if sseq in sent_packets:
                     del sent_packets[sseq]
@@ -382,10 +532,11 @@ class twampySessionSender(udpSession):
                           (address[0], sseq, dp(delayRT), dp(delayOB), dp(delayIB)))
 
                 log.info("Reply from %s [rseq=%d sseq=%d rtt=%.2fms outbound=%.2fms inbound=%.2fms]", address[0], rseq, sseq, delayRT, delayOB, delayIB)
-                self.stats.add(delayRT, delayOB, delayIB, rseq, sseq)
+                self.stats.add(delayRT, delayOB, delayIB, rseq, sseq, order_status)
 
-                if sseq + 1 == self.count:
-                    log.info("All packets received back")
+                # Check if all packets have been sent AND all sent packets received/timed out
+                if len(sent_packets) == 0 and idx >= self.count:
+                    log.info("All packets sent and received back")
                     self.running = False
 
             t1 = now()
@@ -396,6 +547,8 @@ class twampySessionSender(udpSession):
                 if t1 - send_time > self.packet_timeout:
                     timed_out_packets.append(seq_num)
                     del sent_packets[seq_num]
+                    # Track that this packet timed out for late arrival detection
+                    self.timed_out_packets.add(seq_num)
             
             # Print timeout notifications
             if self.print_responses and timed_out_packets:
@@ -443,14 +596,101 @@ class twampySessionReflector(udpSession):
             self.padmix = [8, 8, 8, 8, 8, 8, 8, 534, 534, 534, 534, 1458]
 
         udpSession.__init__(self, addr, port, args.tos, args.ttl, args.do_not_fragment, ipversion)
+        
+        # Testing mode parameters
+        self.test_mode = getattr(args, 'test_mode', False)
+        self.drop_rate = getattr(args, 'drop_rate', 0)
+        self.reorder_rate = getattr(args, 'reorder_rate', 0)
+        self.delay_rate = getattr(args, 'delay_rate', 0)
+        self.max_delay = getattr(args, 'max_delay', 2.0)
+        self.duplicate_rate = getattr(args, 'duplicate_rate', 0)
+        
+        # Testing state tracking
+        self.pending_responses = []  # Queue for delayed/reordered responses
+        self.test_stats = {
+            'dropped': 0,
+            'reordered': 0, 
+            'delayed': 0,
+            'duplicated': 0,
+            'normal': 0
+        }
+        
+        if self.test_mode:
+            log.info("Testing mode enabled: drop=%.1f%% reorder=%.1f%% delay=%.1f%% duplicate=%.1f%%", 
+                     self.drop_rate, self.reorder_rate, self.delay_rate, self.duplicate_rate)
+
+    def decide_test_action(self, sseq):
+        """
+        Decide what testing action to apply to this packet.
+        Returns: ('normal'|'drop'|'delay'|'reorder'|'duplicate', delay_time)
+        """
+        if not self.test_mode:
+            return 'normal', 0
+            
+        # Use cumulative probabilities to ensure only one action per packet
+        rand = random.random() * 100
+        
+        if rand < self.drop_rate:
+            self.test_stats['dropped'] += 1
+            log.info("TEST: Dropping packet [sseq=%d]", sseq)
+            return 'drop', 0
+            
+        elif rand < self.drop_rate + self.duplicate_rate:
+            self.test_stats['duplicated'] += 1
+            log.info("TEST: Duplicating packet [sseq=%d]", sseq)
+            return 'duplicate', 0
+            
+        elif rand < self.drop_rate + self.duplicate_rate + self.delay_rate:
+            delay_time = random.uniform(0.1, self.max_delay)
+            self.test_stats['delayed'] += 1
+            log.info("TEST: Delaying packet [sseq=%d] by %.1fs", sseq, delay_time)
+            return 'delay', delay_time
+            
+        elif rand < self.drop_rate + self.duplicate_rate + self.delay_rate + self.reorder_rate:
+            # Reorder this packet by adding a small delay (0.1-0.5 seconds)
+            delay_time = random.uniform(0.1, 0.5)
+            self.test_stats['reordered'] += 1
+            log.info("TEST: Reordering packet [sseq=%d] with %.1fs delay", sseq, delay_time)
+            return 'reorder', delay_time
+        
+        self.test_stats['normal'] += 1
+        return 'normal', 0
 
     def run(self):
         index = {}
         reset = {}
 
         while self.running:
+            # Process pending delayed responses
+            current_time = now()
+            responses_to_send = []
+            remaining_responses = []
+            
+            for response in self.pending_responses:
+                if current_time >= response['send_time']:
+                    responses_to_send.append(response)
+                else:
+                    remaining_responses.append(response)
+            
+            # Send due responses
+            for response in responses_to_send:
+                self.sendto(response['data'], response['address'])
+                if response['type'] == 'delayed':
+                    log.info("TEST: Sending delayed packet [sseq=%d]", response['sseq'])
+                elif response['type'] == 'reordered':
+                    log.info("TEST: Sending reordered packet [sseq=%d]", response['sseq'])
+            
+            # Update pending responses list
+            self.pending_responses = remaining_responses
+            
             try:
-                data, address = self.recvfrom()
+                # Use select to check for incoming data with timeout
+                ready = select.select([self.socket], [], [], 0.1)
+                if ready[0]:
+                    data, address = self.recvfrom()
+                else:
+                    # No data available, continue to process pending queue
+                    continue
 
                 t2 = now()
                 sec = int(TIMEOFFSET + t2)              # seconds since 1-JAN-1900
@@ -471,17 +711,63 @@ class twampySessionReflector(udpSession):
                 else:
                     idx = index[address]
 
+                # Prepare response data
                 rdata = struct.pack('!L2I2H2I', idx, sec, msec, 0x001, 0, sec, msec)
                 pbytes = zeros(self.padmix[int(len(self.padmix) * random.random())])
-                self.sendto(rdata + data[0:14] + pbytes, address)
+                response_packet = rdata + data[0:14] + pbytes
+                
+                # Decide testing action
+                test_action, delay_time = self.decide_test_action(sseq)
+                
+                if test_action == 'drop':
+                    # Drop packet - no response sent
+                    pass
+                    
+                elif test_action == 'duplicate':
+                    # Send response twice
+                    self.sendto(response_packet, address)
+                    # Small delay before duplicate to ensure different timing
+                    time.sleep(0.001)  
+                    self.sendto(response_packet, address)
+                    
+                elif test_action == 'delay':
+                    # Queue response for delayed sending
+                    send_time = now() + delay_time
+                    pending_response = {
+                        'data': response_packet,
+                        'address': address,
+                        'send_time': send_time,
+                        'sseq': sseq,
+                        'type': 'delayed'
+                    }
+                    self.pending_responses.append(pending_response)
+                    
+                elif test_action == 'reorder':
+                    # Queue response for reordering (small delay to create out-of-order arrival)
+                    send_time = now() + delay_time
+                    pending_response = {
+                        'data': response_packet,
+                        'address': address,
+                        'send_time': send_time,
+                        'sseq': sseq,
+                        'type': 'reordered'
+                    }
+                    self.pending_responses.append(pending_response)
+                        
+                else:  # normal
+                    # Send response immediately
+                    self.sendto(response_packet, address)
 
                 index[address] = idx + 1
                 reset[address] = t2 + 30  # timeout is 30sec
 
             except Exception as e:
                 log.debug('Exception: %s', str(e))
-                break
+                # Don't break immediately - let the loop check self.running
+                # This allows statistics to be printed when Ctrl-C closes the socket
 
+        # Testing statistics are printed in signal handler, no need to duplicate here
+            
         log.info("TWL session reflector stopped")
 
 
@@ -767,6 +1053,14 @@ if __name__ == '__main__':
     group = p_responder.add_argument_group("TWL responder options")
     group.add_argument('near_end', nargs='?', metavar='local-ip:port', default=":20001")
     group.add_argument('--timer', metavar='value',   default=0,     type=int, help='TWL session reset')
+    
+    test_group = p_responder.add_argument_group("Testing options")
+    test_group.add_argument('--test-mode', action='store_true', help='Enable testing mode to simulate network issues')
+    test_group.add_argument('--drop-rate', metavar='percent', default=0, type=float, help='Percentage of packets to drop (0-100, default: 0)')
+    test_group.add_argument('--reorder-rate', metavar='percent', default=0, type=float, help='Percentage of packets to reorder (0-100, default: 0)')
+    test_group.add_argument('--delay-rate', metavar='percent', default=0, type=float, help='Percentage of packets to delay (0-100, default: 0)')
+    test_group.add_argument('--max-delay', metavar='seconds', default=2.0, type=float, help='Maximum delay for delayed packets in seconds (default: 2.0)')
+    test_group.add_argument('--duplicate-rate', metavar='percent', default=0, type=float, help='Percentage of packets to duplicate (0-100, default: 0)')
 
     p_sender = subparsers.add_parser('sender', help='TWL sender', parents=[debug_parser, ipopt_parser])
     group = p_sender.add_argument_group("TWL sender options")
